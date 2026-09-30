@@ -8,21 +8,26 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Path, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from psycopg.errors import CheckViolation
+from psycopg.errors import CheckViolation, DeadlockDetected, SerializationFailure
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import db, geometry, repository
 from .schemas import (
+    BatchChangeRequest,
+    BatchChangeResponse,
     RegionCreate,
     RegionCreatedResponse,
     RegionOut,
+    RegionResultOut,
     RegionUpdate,
     RevisionOut,
     ScheduleRequest,
     ScheduleResponse,
+    TrajectoryCheckOut,
     VerifyRequest,
     VerifyResponse,
+    _iso_z,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -38,8 +43,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="临时限行核验服务",
-    version="1.1.0",
-    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间。",
+    version="1.2.0",
+    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，计算安全出发区间，"
+                "并支持携带预期 revision 的多区域原子批量变更与变更后轨迹核验。",
     lifespan=lifespan,
 )
 
@@ -53,6 +59,37 @@ class DomainError(Exception):
         super().__init__(message)
         self.message = message
         self.loc = loc or []
+
+
+class RevisionConflict(Exception):
+    """expected_revision 与当前全局 revision 不一致（HTTP 409）。"""
+
+    def __init__(self, expected: int, current: int):
+        self.expected = expected
+        self.current = current
+
+
+class RegionNotFoundInBatch(Exception):
+    """批量变更引用了不存在的区域（HTTP 422，区别于 revision 过期）。"""
+
+    def __init__(self, region_id: int, op_index: int):
+        self.region_id = region_id
+        self.op_index = op_index
+
+
+class DuplicateRegionInBatch(Exception):
+    """同一现有区域在一批中出现了多次（HTTP 422）。"""
+
+    def __init__(self, region_id: int, op_index: int):
+        self.region_id = region_id
+        self.op_index = op_index
+
+
+class TrajectoryUnsafe(Exception):
+    """变更后区域集合上存在不安全轨迹（HTTP 422，整批不落库）。"""
+
+    def __init__(self, details: list[dict]):
+        self.details = details
 
 
 def _error_response(status: int, code: str, message: str, details=None) -> JSONResponse:
@@ -116,6 +153,53 @@ async def _on_region_error(_request: Request, exc: geometry.RegionError):
 @app.exception_handler(geometry.TrajectoryError)
 async def _on_trajectory_error(_request: Request, exc: geometry.TrajectoryError):
     return _error_response(422, "invalid_trajectory", str(exc))
+
+
+@app.exception_handler(RevisionConflict)
+async def _on_revision_conflict(_request: Request, exc: RevisionConflict):
+    return _error_response(
+        409,
+        "revision_conflict",
+        f"expected_revision={exc.expected} 已过期，当前 revision={exc.current}",
+        [{"expected_revision": exc.expected, "current_revision": exc.current}],
+    )
+
+
+@app.exception_handler(RegionNotFoundInBatch)
+async def _on_region_not_found_in_batch(_request: Request, exc: RegionNotFoundInBatch):
+    return _error_response(
+        422,
+        "region_not_found",
+        f"operations[{exc.op_index}] 引用的区域 {exc.region_id} 不存在",
+        [{"loc": ["body", "operations", exc.op_index, "region_id"],
+          "op_index": exc.op_index, "region_id": exc.region_id}],
+    )
+
+
+@app.exception_handler(DuplicateRegionInBatch)
+async def _on_duplicate_region_in_batch(_request: Request, exc: DuplicateRegionInBatch):
+    return _error_response(
+        422,
+        "duplicate_region_operation",
+        f"区域 {exc.region_id} 在同一批中出现了多次（operations[{exc.op_index}]）",
+        [{"loc": ["body", "operations", exc.op_index, "region_id"],
+          "op_index": exc.op_index, "region_id": exc.region_id}],
+    )
+
+
+@app.exception_handler(repository.PlanValidationError)
+async def _on_plan_validation_error(_request: Request, exc: repository.PlanValidationError):
+    return _error_response(422, "invalid_input", str(exc))
+
+
+@app.exception_handler(TrajectoryUnsafe)
+async def _on_trajectory_unsafe(_request: Request, exc: TrajectoryUnsafe):
+    return _error_response(
+        422,
+        "trajectory_unsafe",
+        "存在轨迹在变更后的区域集合上不安全，整批变更未提交",
+        exc.details,
+    )
 
 
 # ---------------------------------------------------------------- 区域管理
@@ -211,7 +295,232 @@ def current_revision():
     return RevisionOut(revision=revision)
 
 
+# ---------------------------------------------------------------- 批量原子变更
+
+@app.post(
+    "/api/changes",
+    response_model=BatchChangeResponse,
+    tags=["batch"],
+    responses={
+        409: {"description": "expected_revision 已过期（revision_conflict）"},
+        422: {"description": "区域不存在/重复操作/非法数据/轨迹不安全等"},
+    },
+)
+def apply_batch_change(payload: BatchChangeRequest):
+    """把多处限行区域变更作为一次原子提交，并保证指定轨迹变更后仍安全。
+
+    流程（全部在单个写事务内，任何一步失败均整体回滚、不落库）：
+    1. 静态校验：同一现有区域在一批中只能出现一次；update 必须至少带一个字段；
+       create/合并后的生效时段必须满足 valid_from < valid_to；
+    2. 锁定 region_meta 单行，读取当前 revision 并与 expected_revision 比较，
+       过期则 409（revision_conflict）；
+    3. 按 id 升序锁定本批涉及的现存区域（FOR UPDATE），不存在则 422
+       （region_not_found）；构造变更后的完整区域集合；
+    4. 对每条带时区的绝对时刻轨迹，按直线匀速、边界接触即穿越、生效时段
+       左闭右开规则核验「变更后」完整集合；任一轨迹不安全则 422
+       （trajectory_unsafe，列出轨迹与逐区域穿越明细），不落库；
+    5. 全部合法且安全后，统一执行登记/修订/删除：修订沿用 version+1，整批
+       全局 revision 只递增一次，随后提交。
+
+    并发性：meta 单行锁串行化所有写事务，区域行锁避免丢失更新；并发区域变更
+    无法绕过第 4 步核验（行锁会等待并发写者提交，随后按其已提交结果重新核验）。
+    """
+    # ---- 1. 不依赖数据库的静态校验（快速失败，此时尚未开启写事务） ----
+    seen: dict[int, int] = {}
+    for index, entry in enumerate(payload.operations):
+        if entry.op in ("update", "delete"):
+            rid = entry.region_id
+            if rid in seen:
+                raise DuplicateRegionInBatch(rid, index)
+            seen[rid] = index
+        if entry.op == "update":
+            body = entry.region
+            if (body.name is None and body.polygon is None
+                    and body.valid_from is None and body.valid_to is None):
+                raise DomainError(
+                    "update 操作必须至少给出一个待修订字段（name/polygon/"
+                    "valid_from/valid_to）",
+                    ["body", "operations", index, "region"],
+                )
+
+    # 轨迹在几何层统一校验时刻严格递增、坐标有限等（带时区已由 schema 保证）
+    trajectories = [
+        geometry.validate_trajectory(spec.points, lambda p: p.t)
+        for spec in payload.trajectories
+    ]
+
+    # ---- 2-5. 单事务内完成 revision 检查、加锁、核验与落库 ----
+    with db.pool.connection() as conn:
+        conn.rollback()  # 丢弃连接池中可能残留的事务状态
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            cur.execute("BEGIN")
+            try:
+                # meta 行锁：拿到稳定的当前 revision，并串行化所有批量写
+                cur.execute(
+                    "SELECT revision FROM region_meta WHERE id = 1 FOR UPDATE"
+                )
+                current_rev = cur.fetchone()["revision"]
+                if current_rev != payload.expected_revision:
+                    raise RevisionConflict(payload.expected_revision, current_rev)
+
+                # 锁定全部现存区域（按 id 升序 FOR UPDATE）：核验针对的是变更后
+                # 完整集合，锁定所有行可避免读到并发写者的中间状态，同时让本事务
+                # 等待并发写者提交后基于其最新已提交结果构造集合
+                locked = repository.lock_all_region_rows(cur)
+                try:
+                    proposed, deleted_versions = (
+                        repository.build_proposed_regions(
+                            payload.operations, locked
+                        )
+                    )
+                except repository.RegionMissing as exc:
+                    raise RegionNotFoundInBatch(exc.region_id, exc.op_index) from exc
+
+                # 对变更后的完整集合核验全部轨迹
+                all_checks = []
+                unsafe_details = []
+                for i, traj in enumerate(trajectories):
+                    results = geometry.verify_trajectory(traj, proposed)
+                    safe = all(len(r["crossings"]) == 0 for r in results)
+                    all_checks.append({
+                        "traj_index": i,
+                        "name": payload.trajectories[i].name,
+                        "safe": safe,
+                        "results": results,
+                    })
+                    if not safe:
+                        violations = [
+                            {
+                                "region_id": r["region_id"],
+                                "region_name": r["region_name"],
+                                "crossings": r["crossings"],
+                            }
+                            for r in results if r["crossings"]
+                        ]
+                        unsafe_details.append({
+                            "loc": ["body", "trajectories", i],
+                            "traj_index": i,
+                            "name": payload.trajectories[i].name,
+                            "violations": violations,
+                        })
+                if unsafe_details:
+                    # 穿越时刻此时是 epoch 秒，转成 UTC ISO8601（带 Z）便于客户端阅读
+                    for detail in unsafe_details:
+                        for v in detail["violations"]:
+                            v["crossings"] = [
+                                {
+                                    **c,
+                                    "entry_time": _iso_z(datetime.fromtimestamp(
+                                        c["entry_time"], tz=timezone.utc)),
+                                    "exit_time": _iso_z(datetime.fromtimestamp(
+                                        c["exit_time"], tz=timezone.utc)),
+                                }
+                                for c in v["crossings"]
+                            ]
+                    raise TrajectoryUnsafe(unsafe_details)
+
+                # 全部安全：统一落库，整批 revision 只 +1
+                affected, new_revision = repository.apply_changes(
+                    cur, payload.operations, locked
+                )
+            except (RevisionConflict, RegionNotFoundInBatch,
+                    DuplicateRegionInBatch, TrajectoryUnsafe,
+                    repository.PlanValidationError, DomainError,
+                    geometry.TrajectoryError, geometry.RegionError):
+                conn.rollback()
+                raise
+            except (DeadlockDetected, SerializationFailure) as exc:
+                conn.rollback()
+                raise DomainError(
+                    "区域并发修改冲突，请重新读取最新 revision 与区域集合后重试"
+                ) from exc
+
+        # with-cursor 已结束但事务仍打开；显式提交
+        conn.commit()
+
+    # ---- 组装成功响应（事务外，仅做数据整形） ----
+    affected_by_index = {a["op_index"]: a["region"] for a in affected}
+    # 新建区域核验时用的是负临时 id，这里按 op_index 回填为真实 id
+    temp_to_real: dict[int, int] = {}
+    create_seq = 0
+    for index, entry in enumerate(payload.operations):
+        if entry.op == "create":
+            create_seq += 1
+            temp_to_real[-create_seq] = affected_by_index[index]["id"]
+    op_results = []
+    for index, entry in enumerate(payload.operations):
+        if entry.op == "create":
+            region = affected_by_index[index]
+            op_results.append({
+                "op": "create",
+                "op_index": index,
+                "region_id": region["id"],
+                "region": RegionOut.model_validate(region),
+                "version": region["version"],
+            })
+        elif entry.op == "update":
+            region = affected_by_index[index]
+            op_results.append({
+                "op": "update",
+                "op_index": index,
+                "region_id": entry.region_id,
+                "region": RegionOut.model_validate(region),
+                "version": region["version"],
+            })
+        else:
+            deleted_row = next(
+                d for d in deleted_versions if d["region_id"] == entry.region_id
+            )
+            op_results.append({
+                "op": "delete",
+                "op_index": index,
+                "region_id": entry.region_id,
+                "version": deleted_row["version"],
+            })
+
+    traj_out = []
+    for chk in all_checks:
+        shaped = _crossings_out(chk["results"])
+        for r in shaped:
+            if r["region_id"] in temp_to_real:
+                r["region_id"] = temp_to_real[r["region_id"]]
+        traj_out.append(TrajectoryCheckOut(
+            traj_index=chk["traj_index"],
+            name=chk["name"],
+            safe=True,
+            results=[RegionResultOut.model_validate(r) for r in shaped],
+        ))
+
+    return BatchChangeResponse(
+        revision=new_revision,
+        operations=op_results,
+        trajectories=traj_out,
+    )
+
+
 # ---------------------------------------------------------------- 轨迹核验
+
+def _crossings_out(results) -> list[dict]:
+    """把几何引擎的 epoch 秒穿越结果转成响应用的 UTC datetime 结构。"""
+    out_results = []
+    for r in results:
+        crossings = []
+        for c in r["crossings"]:
+            crossings.append({
+                "entry_time": datetime.fromtimestamp(c["entry_time"], tz=timezone.utc),
+                "exit_time": datetime.fromtimestamp(c["exit_time"], tz=timezone.utc),
+                "entry_inclusive": c["entry_inclusive"],
+                "exit_inclusive": c["exit_inclusive"],
+                "point_contact": c["point_contact"],
+            })
+        out_results.append({
+            "region_id": r["region_id"],
+            "region_name": r["region_name"],
+            "crossings": crossings,
+        })
+    return out_results
+
 
 @app.post("/api/verify", response_model=VerifyResponse, tags=["verification"])
 def verify(payload: VerifyRequest):
@@ -242,23 +551,7 @@ def verify(payload: VerifyRequest):
 
     checked_at = datetime.now(timezone.utc)
     safe = all(len(r["crossings"]) == 0 for r in results)
-
-    out_results = []
-    for r in results:
-        crossings = []
-        for c in r["crossings"]:
-            crossings.append({
-                "entry_time": datetime.fromtimestamp(c["entry_time"], tz=timezone.utc),
-                "exit_time": datetime.fromtimestamp(c["exit_time"], tz=timezone.utc),
-                "entry_inclusive": c["entry_inclusive"],
-                "exit_inclusive": c["exit_inclusive"],
-                "point_contact": c["point_contact"],
-            })
-        out_results.append({
-            "region_id": r["region_id"],
-            "region_name": r["region_name"],
-            "crossings": crossings,
-        })
+    out_results = _crossings_out(results)
 
     return VerifyResponse(
         safe=safe,
@@ -346,7 +639,8 @@ def root():
         "endpoints": [
             "POST /api/regions", "GET /api/regions", "GET /api/regions/{id}",
             "PATCH /api/regions/{id}", "DELETE /api/regions/{id}",
-            "GET /api/revision", "POST /api/verify", "POST /api/schedule",
+            "GET /api/revision", "POST /api/changes",
+            "POST /api/verify", "POST /api/schedule",
             "GET /health",
         ],
     }

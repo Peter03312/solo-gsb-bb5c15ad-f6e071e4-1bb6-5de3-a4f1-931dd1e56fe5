@@ -520,6 +520,368 @@ finally:
     geometry.safe_departure_intervals = orig_safe
 client.delete(f"/api/regions/{snap_rid}")
 
+# ================================================================= 批量原子变更
+# 本段全部使用 x>=5000 的隔离坐标，避免与前面用例的遗留区域互相干扰。
+def bpost(body):
+    return client.post("/api/changes", json=body)
+
+
+# 危险轨迹：(-5,5)->(15,5) 的局部模式，平移到隔离区域上用时给出具体坐标
+def crossing_traj(x0=-5.0, y0=5005.0, x2=15.0):
+    return [{"x": x0, "y": y0, "t": "2026-09-30T00:00:00Z"},
+            {"x": x2, "y": y0, "t": "2026-09-30T00:01:00Z"}]
+
+
+def point_touch_traj():
+    # 相对方区 [5000,5010]x[5000,5010]：5s 时擦过右上角 (5010,5010)
+    return [{"x": 5005, "y": 5015, "t": "2026-09-30T00:00:00Z"},
+            {"x": 5015, "y": 5005, "t": "2026-09-30T00:00:10Z"}]
+
+
+SEPT = {"valid_from": "2026-09-01T00:00:00Z", "valid_to": "2026-10-01T00:00:00Z"}
+
+
+def square(x0, y0, x1, y1):
+    return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+
+
+# 准备两个区域：一个用于修订、一个用于删除
+r = client.post("/api/regions", json={"name": "批量-待修订",
+              "polygon": square(5000, 5000, 5010, 5010), **SEPT})
+b_upd_id = r.json()["region"]["id"]
+r = client.post("/api/regions", json={"name": "批量-待删除",
+              "polygon": square(5200, 5000, 5210, 5010), **SEPT})
+b_del_id = r.json()["region"]["id"]
+rev0 = client.get("/api/revision").json()["revision"]
+
+# ---- 成功：一次提交含 create/update/delete，revision 只 +1，全部轨迹安全 ----
+r = bpost({
+    "expected_revision": rev0,
+    "operations": [
+        {"op": "update", "region_id": b_upd_id,
+         "region": {"name": "批量-已修订"}},
+        {"op": "delete", "region_id": b_del_id},
+        {"op": "create", "region": {"name": "批量-新建",
+         "polygon": square(5300, 5000, 5310, 5010), **SEPT}},
+    ],
+    "trajectories": [{"name": "安全", "points": [
+        {"x": 90000, "y": 90000, "t": "2026-09-30T00:00:00Z"},
+        {"x": 90010, "y": 90010, "t": "2026-09-30T00:01:00Z"}]}],
+})
+check("批量提交 200", r.status_code == 200, r.text)
+b = r.json()
+check("批量整 revision 只 +1", b["revision"] == rev0 + 1, str(b))
+check("操作结果 3 条且顺序与请求一致",
+      [o["op"] for o in b["operations"]] == ["update", "delete", "create"])
+upd_res = next(o for o in b["operations"] if o["op"] == "update")
+del_res = next(o for o in b["operations"] if o["op"] == "delete")
+cre_res = next(o for o in b["operations"] if o["op"] == "create")
+b_new_id = cre_res["region_id"]
+check("修订沿用 version+1", upd_res["version"] == 2 and upd_res["region"]["version"] == 2)
+check("新建 version=1", cre_res["version"] == 1)
+check("删除返回删除前版本 version=1", del_res["version"] == 1)
+check("修订名称生效", upd_res["region"]["name"] == "批量-已修订")
+check("删除已落库", client.get(f"/api/regions/{b_del_id}").status_code == 404)
+check("新建已落库", client.get(f"/api/regions/{b_new_id}").status_code == 200)
+check("轨迹结果回填真实新建 id（无负临时 id）",
+      all(x["region_id"] >= 1 for x in b["trajectories"][0]["results"])
+      and any(x["region_id"] == b_new_id for x in b["trajectories"][0]["results"]))
+check("成功响应轨迹 safe=true", b["trajectories"][0]["safe"] is True)
+rev1 = b["revision"]
+
+# ---- revision 过期：409 revision_conflict，可区分，不落库 ----
+r = bpost({
+    "expected_revision": rev0,
+    "operations": [{"op": "create", "region": {"name": "不应存在",
+         "polygon": square(5400, 5000, 5410, 5010), **SEPT}}],
+    "trajectories": [{"points": [
+        {"x": 90000, "y": 90000, "t": "2026-09-30T00:00:00Z"},
+        {"x": 90010, "y": 90010, "t": "2026-09-30T00:01:00Z"}]}],
+})
+check("过期 revision 409", r.status_code == 409, r.text)
+check("错误码 revision_conflict", r.json()["error"]["code"] == "revision_conflict")
+check("409 details 带 expected/current",
+      r.json()["error"]["details"][0]["current_revision"] == rev1
+      and r.json()["error"]["details"][0]["expected_revision"] == rev0)
+check("409 不落库 revision 不变",
+      client.get("/api/revision").json()["revision"] == rev1)
+
+# ---- 区域不存在：422 region_not_found（delete 与 update 两种） ----
+r = bpost({
+    "expected_revision": rev1,
+    "operations": [{"op": "delete", "region_id": 999999}],
+    "trajectories": [{"points": [
+        {"x": 90000, "y": 90000, "t": "2026-09-30T00:00:00Z"},
+        {"x": 90010, "y": 90010, "t": "2026-09-30T00:01:00Z"}]}],
+})
+check("删除不存在 422 region_not_found", r.status_code == 422 and
+      r.json()["error"]["code"] == "region_not_found", r.text)
+check("region_not_found details 带 op_index 与 region_id",
+      r.json()["error"]["details"][0]["op_index"] == 0
+      and r.json()["error"]["details"][0]["region_id"] == 999999)
+
+r = bpost({
+    "expected_revision": rev1,
+    "operations": [{"op": "update", "region_id": 999999, "region": {"name": "x"}}],
+    "trajectories": [{"points": [
+        {"x": 90000, "y": 90000, "t": "2026-09-30T00:00:00Z"},
+        {"x": 90010, "y": 90010, "t": "2026-09-30T00:01:00Z"}]}],
+})
+check("修订不存在 422 region_not_found", r.status_code == 422 and
+      r.json()["error"]["code"] == "region_not_found", r.text)
+check("不存在时 revision 不变",
+      client.get("/api/revision").json()["revision"] == rev1)
+
+# ---- 同一现有区域在一批中出现两次 ----
+r = bpost({
+    "expected_revision": rev1,
+    "operations": [
+        {"op": "update", "region_id": b_upd_id, "region": {"name": "a"}},
+        {"op": "delete", "region_id": b_upd_id},
+    ],
+    "trajectories": [{"points": [
+        {"x": 90000, "y": 90000, "t": "2026-09-30T00:00:00Z"},
+        {"x": 90010, "y": 90010, "t": "2026-09-30T00:01:00Z"}]}],
+})
+check("同区域重复操作 422 duplicate_region_operation", r.status_code == 422 and
+      r.json()["error"]["code"] == "duplicate_region_operation", r.text)
+check("重复操作不落库（名称未变、仍可查）",
+      client.get(f"/api/regions/{b_upd_id}").json()["name"] == "批量-已修订")
+
+# ---- 非法数据：空 update / 自相交多边形 / 合并后时段非法 ----
+r = bpost({
+    "expected_revision": rev1,
+    "operations": [{"op": "update", "region_id": b_upd_id, "region": {}}],
+    "trajectories": [{"points": [
+        {"x": 90000, "y": 90000, "t": "2026-09-30T00:00:00Z"},
+        {"x": 90010, "y": 90010, "t": "2026-09-30T00:01:00Z"}]}],
+})
+check("空 update 422 invalid_input", r.status_code == 422 and
+      r.json()["error"]["code"] == "invalid_input", r.text)
+
+r = bpost({
+    "expected_revision": rev1,
+    "operations": [{"op": "create", "region": {"name": "坏多边形",
+         "polygon": [[5000, 5000], [5010, 5010], [5010, 5000], [5000, 5010]],
+         **SEPT}}],
+    "trajectories": [{"points": [
+        {"x": 90000, "y": 90000, "t": "2026-09-30T00:00:00Z"},
+        {"x": 90010, "y": 90010, "t": "2026-09-30T00:01:00Z"}]}],
+})
+check("批量中自相交多边形 422", r.status_code == 422, r.text)
+
+r = bpost({
+    "expected_revision": rev1,
+    "operations": [{"op": "update", "region_id": b_upd_id, "region": {
+        "valid_from": "2026-11-01T00:00:00Z",
+        "valid_to": "2026-10-01T00:00:00Z"}}],
+    "trajectories": [{"points": [
+        {"x": 90000, "y": 90000, "t": "2026-09-30T00:00:00Z"},
+        {"x": 90010, "y": 90010, "t": "2026-09-30T00:01:00Z"}]}],
+})
+check("合并后时段非法 422 invalid_input", r.status_code == 422 and
+      r.json()["error"]["code"] == "invalid_input", r.text)
+
+# ---- 非法轨迹：逆序 / 不带时区 / 不足两点；空操作空轨迹；未知 op ----
+def one_create(name="x"):
+    return [{"op": "create", "region": {"name": name,
+             "polygon": square(5500, 5000, 5510, 5010), **SEPT}}]
+
+
+r = bpost({"expected_revision": rev1, "operations": one_create(),
+           "trajectories": [{"points": [
+               {"x": 0, "y": 5005, "t": "2026-09-30T00:00:10Z"},
+               {"x": 1, "y": 5005, "t": "2026-09-30T00:00:00Z"}]}]})
+check("批量中逆序轨迹 422 invalid_trajectory", r.status_code == 422 and
+      r.json()["error"]["code"] == "invalid_trajectory", r.text)
+
+r = bpost({"expected_revision": rev1, "operations": one_create(),
+           "trajectories": [{"points": [
+               {"x": 0, "y": 5005, "t": "2026-09-30T00:00:00"},
+               {"x": 1, "y": 5005, "t": "2026-09-30T00:00:10"}]}]})
+check("批量轨迹不带时区 422", r.status_code == 422, r.text)
+
+r = bpost({"expected_revision": rev1, "operations": one_create(),
+           "trajectories": [{"points": [
+               {"x": 0, "y": 5005, "t": "2026-09-30T00:00:00Z"}]}]})
+check("批量轨迹不足两点 422", r.status_code == 422, r.text)
+
+r = bpost({"expected_revision": rev1, "operations": [], "trajectories": []})
+check("空操作空轨迹 422", r.status_code == 422, r.text)
+
+r = bpost({"expected_revision": rev1,
+           "operations": [{"op": "frobnicate", "region_id": 1}],
+           "trajectories": [{"points": [
+               {"x": 0, "y": 5005, "t": "2026-09-30T00:00:00Z"},
+               {"x": 1, "y": 5005, "t": "2026-09-30T00:00:10Z"}]}]})
+check("未知操作类型 422", r.status_code == 422, r.text)
+check("上述全部非法批均未落库（revision 仍为 rev1）",
+      client.get("/api/revision").json()["revision"] == rev1)
+
+# ---- 轨迹不安全：对变更后完整集合核验，列出穿越明细，整批不落库 ----
+# b_upd_id 已扩大为 [5000,5020]x[5000,5020]；轨迹 (4995,5005)->(5015,5005)
+# 在 15s 进入、45s 离开。
+r = bpost({
+    "expected_revision": rev1,
+    "operations": [
+        {"op": "update", "region_id": b_upd_id, "region": {"name": "批量-扩大"}},
+        {"op": "create", "region": {"name": "批量-不该建成",
+         "polygon": square(5600, 5000, 5610, 5010), **SEPT}},
+    ],
+    "trajectories": [{"name": "穿越轨迹",
+                      # b_upd_id 几何为初始的 10 宽方区 [5000,5010]，仅改名；
+                      # 轨迹跨度 20，15s 进入、45s 离开
+                      "points": crossing_traj(4995, 5005, 5015)}],
+})
+check("不安全轨迹 422 trajectory_unsafe", r.status_code == 422 and
+      r.json()["error"]["code"] == "trajectory_unsafe", r.text)
+det = r.json()["error"]["details"]
+check("不安全详情定位到 trajectories[0]", det[0]["traj_index"] == 0
+      and det[0]["name"] == "穿越轨迹")
+vregions = {v["region_name"]: v["crossings"] for v in det[0]["violations"]}
+check("明细含现存（修订后）区域穿越区间 [15s,45s]",
+      "批量-扩大" in vregions
+      and vregions["批量-扩大"][0]["entry_time"] == "2026-09-30T00:00:15Z"
+      and vregions["批量-扩大"][0]["exit_time"] == "2026-09-30T00:00:45Z",
+      str(det)[:300])
+check("不安全时整批不落库：修订名未变、新区未建、revision 不变",
+      client.get(f"/api/regions/{b_upd_id}").json()["name"] == "批量-已修订"
+      and all(x["name"] != "批量-不该建成" for x in client.get("/api/regions").json())
+      and client.get("/api/revision").json()["revision"] == rev1)
+
+# ---- 边界接触即穿越：擦过顶点也算不安全 ----
+r = bpost({
+    "expected_revision": rev1,
+    "operations": [{"op": "create", "region": {"name": "批量-点接触",
+         "polygon": square(5000, 5000, 5010, 5010), **SEPT}}],
+    "trajectories": [{"points": point_touch_traj()}],
+})
+check("单点接触轨迹同样判不安全 422", r.status_code == 422 and
+      r.json()["error"]["code"] == "trajectory_unsafe", r.text)
+pc = [c for v in r.json()["error"]["details"][0]["violations"]
+      for c in v["crossings"]]
+check("明细标记 point_contact 且起止相同",
+      any(c["point_contact"] and c["entry_time"] == c["exit_time"] for c in pc),
+      str(pc)[:300])
+
+# ---- 生效时段左闭右开：跨过 valid_to 被截断；恰在 valid_to 已失效则安全 ----
+r = bpost({
+    "expected_revision": rev1,
+    "operations": [{"op": "create", "region": {"name": "批量-右端点",
+         "polygon": square(5000, 5000, 5010, 5010),
+         "valid_from": "2026-09-30T00:00:00Z",
+         "valid_to": "2026-09-30T00:00:30Z"}}],
+    "trajectories": [{"points": crossing_traj(4995, 5005, 5015)}],
+})
+check("跨 valid_to 穿越仍违规（截断到 [..,30)）", r.status_code == 422 and
+      r.json()["error"]["code"] == "trajectory_unsafe", r.text)
+c30 = [c for v in r.json()["error"]["details"][0]["violations"]
+       for c in v["crossings"] if v["region_name"] == "批量-右端点"][0]
+check("穿越在 valid_to 处截断且 exit_inclusive=false",
+      c30["exit_time"] == "2026-09-30T00:00:30Z" and c30["exit_inclusive"] is False,
+      str(c30))
+
+# 区域恰在轨迹首点时刻失效（右端开）：接触发生在 [valid_to, ...]，不参与核验
+r = bpost({
+    "expected_revision": rev1,
+    "operations": [{"op": "create", "region": {"name": "批量-已失效",
+         "polygon": square(6000, 5000, 6010, 5010),
+         "valid_from": "2026-09-29T00:00:00Z",
+         "valid_to": "2026-09-30T00:00:00Z"}}],
+    "trajectories": [{"points": crossing_traj(5995, 5005, 6015)}],
+})
+check("区域在轨迹开始时已失效（右端开）→ 整批安全提交",
+      r.status_code == 200, r.text)
+expired_new = next(o for o in r.json()["operations"]
+                   if o["region"]["name"] == "批量-已失效")["region_id"]
+rev1 = r.json()["revision"]
+
+# ---- 多条轨迹：任一不安全即拒绝，只列出不安全的那条 ----
+r = bpost({
+    "expected_revision": rev1,
+    "operations": [{"op": "create", "region": {"name": "批量-多轨迹",
+         "polygon": square(5000, 5000, 5010, 5010), **SEPT}}],
+    "trajectories": [
+        {"name": "安全条", "points": [
+            {"x": 90000, "y": 90000, "t": "2026-09-30T00:00:00Z"},
+            {"x": 90010, "y": 90010, "t": "2026-09-30T00:01:00Z"}]},
+        {"name": "危险条", "points": crossing_traj(4995, 5005, 5015)},
+    ],
+})
+check("两条轨迹中第二条不安全 → 422", r.status_code == 422 and
+      r.json()["error"]["code"] == "trajectory_unsafe", r.text)
+check("只列出不安全的那条（traj_index=1）",
+      [d["traj_index"] for d in r.json()["error"]["details"]] == [1]
+      and r.json()["error"]["details"][0]["name"] == "危险条")
+
+# ---- 删除挡路区域使原本危险的轨迹安全：核验基于「变更后」完整集合 ----
+# 先新建一个隔离挡路区域（避免删 b_upd_id 影响后续并发用例对它的依赖）
+r = client.post("/api/regions", json={"name": "批量-挡路",
+              "polygon": square(5700, 5000, 5710, 5010), **SEPT})
+block_id = r.json()["region"]["id"]
+rev1 = client.get("/api/revision").json()["revision"]
+r = bpost({
+    "expected_revision": rev1,
+    "operations": [{"op": "delete", "region_id": block_id}],
+    "trajectories": [{"name": "删后安全",
+                      "points": crossing_traj(5695, 5005, 5715)}],
+})
+check("删除挡路区域后轨迹安全 → 提交成功", r.status_code == 200, r.text)
+check("删除批返回被删区域旧版本 version=1",
+      next(o for o in r.json()["operations"] if o["op"] == "delete")["version"] == 1)
+rev1 = r.json()["revision"]
+
+# ---- 并发：批量持 meta 行锁期间，其它写请求不能绕过该批串行提交 ----
+orig_verify = geometry.verify_trajectory
+batch_barrier = threading.Event()
+
+
+def slow_batch_verify(traj, regions):
+    batch_barrier.set()
+    time.sleep(1.0)
+    return orig_verify(traj, regions)
+
+
+geometry.verify_trajectory = slow_batch_verify
+try:
+    holder = {}
+
+    def batch_worker():
+        holder["r"] = bpost({
+            "expected_revision": rev1,
+            "operations": [{"op": "create", "region": {"name": "批量-并发中",
+                 "polygon": square(5800, 5000, 5810, 5010), **SEPT}}],
+            "trajectories": [{"points": [
+                {"x": 90000, "y": 90000, "t": "2026-09-30T00:00:00Z"},
+                {"x": 90010, "y": 90010, "t": "2026-09-30T00:01:00Z"}]}],
+        })
+
+    th = threading.Thread(target=batch_worker)
+    th.start()
+    batch_barrier.wait(5)
+    t0 = time.time()
+    r_conc = client.post("/api/regions", json={"name": "批量-并发插队",
+              "polygon": square(5900, 5000, 5910, 5010), **SEPT})
+    waited = time.time() - t0
+    th.join(timeout=10)
+    check("批量进行中并发写被阻塞（等待 meta 锁）", waited >= 0.9,
+          f"waited={waited:.2f}s")
+    check("批量与并发写最终都成功（各自一个 revision，不丢更新）",
+          holder["r"].status_code == 200 and r_conc.status_code == 201,
+          f"batch={holder['r'].status_code} conc={r_conc.status_code}")
+    revs = sorted([holder["r"].json()["revision"], r_conc.json()["revision"]])
+    check("两次写各占一个 revision（连续 +1，批量不跳号）",
+          revs == [rev1 + 1, rev1 + 2], str(revs))
+    conc_id = r_conc.json()["region"]["id"]
+    batch_conc_id = next(o for o in holder["r"].json()["operations"]
+                         if o["region"]["name"] == "批量-并发中")["region_id"]
+finally:
+    geometry.verify_trajectory = orig_verify
+
+# 清理批量测试产生的区域
+for rid in [b_upd_id, b_new_id, expired_new, conc_id, batch_conc_id]:
+    client.delete(f"/api/regions/{rid}")
+
 print()
 if failures:
     print(f"{len(failures)} 个失败")

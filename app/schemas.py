@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
+from typing import Annotated, Literal, Union
 
 from pydantic import (
     BaseModel,
@@ -145,6 +146,62 @@ class ScheduleRequest(BaseModel):
         return _require_utc(v, info.field_name)
 
 
+# ---------------------------------------------------------------- 批量原子变更
+
+class _BatchOpBase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class CreateOp(_BatchOpBase):
+    """登记新区域；字段语义与 POST /api/regions 一致。"""
+
+    op: Literal["create"]
+    region: RegionCreate
+
+
+class UpdateOp(_BatchOpBase):
+    """修订现有区域（部分更新）；字段任意组合，但至少给出一个字段。"""
+
+    op: Literal["update"]
+    region_id: int = Field(ge=1)
+    region: RegionUpdate
+
+
+class DeleteOp(_BatchOpBase):
+    """删除现有区域。"""
+
+    op: Literal["delete"]
+    region_id: int = Field(ge=1)
+
+
+BatchOp = Annotated[
+    Union[CreateOp, UpdateOp, DeleteOp],
+    Field(discriminator="op"),
+]
+
+
+class TrajectorySpec(_BatchOpBase):
+    """批量变更附带的核验轨迹：绝对时刻、必须带时区。"""
+
+    name: str | None = Field(default=None, max_length=200)
+    points: list[PointIn] = Field(min_length=2)
+
+
+class BatchChangeRequest(BaseModel):
+    """一次原子提交：登记/修订/删除多个区域 + 对多条轨迹做变更后核验。
+
+    * expected_revision：提交方预期的当前全局 revision，不匹配则整批拒绝；
+    * operations：至少一条；同一现有区域在一批中至多出现一次；
+    * trajectories：至少一条带时区的绝对时刻轨迹；
+    * 仅当 revision 匹配、操作合法且全部轨迹在变更后的完整区域集合上安全时
+      才整体落库，整批 revision 只递增一次。
+    """
+
+    expected_revision: int = Field(ge=0)
+    operations: list[BatchOp] = Field(min_length=1)
+    trajectories: list[TrajectorySpec] = Field(min_length=1)
+
+
 # ---------------------------------------------------------------- 响应模型
 
 def _iso_z(dt: datetime) -> str:
@@ -215,6 +272,49 @@ class RegionCreatedResponse(_UTCDatetimeModel):
 
 class RevisionOut(BaseModel):
     revision: int
+
+
+class _OpResultBase(BaseModel):
+    op_index: int
+
+
+class CreateOpResult(_OpResultBase, _UTCDatetimeModel):
+    op: Literal["create"]
+    region_id: int
+    region: RegionOut
+    version: int
+
+
+class UpdateOpResult(_OpResultBase, _UTCDatetimeModel):
+    op: Literal["update"]
+    region_id: int
+    region: RegionOut
+    version: int
+
+
+class DeleteOpResult(_OpResultBase):
+    op: Literal["delete"]
+    region_id: int
+    version: int = Field(description="删除前的最后版本号")
+
+
+BatchOpResult = Annotated[
+    Union[CreateOpResult, UpdateOpResult, DeleteOpResult],
+    Field(discriminator="op"),
+]
+
+
+class TrajectoryCheckOut(_UTCDatetimeModel):
+    traj_index: int
+    name: str | None
+    safe: bool
+    results: list[RegionResultOut]
+
+
+class BatchChangeResponse(_UTCDatetimeModel):
+    revision: int
+    operations: list[BatchOpResult]
+    trajectories: list[TrajectoryCheckOut]
 
 
 class ErrorOut(BaseModel):

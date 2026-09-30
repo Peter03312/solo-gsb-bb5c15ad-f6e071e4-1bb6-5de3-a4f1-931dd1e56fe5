@@ -124,4 +124,43 @@ B_ID=$(curl -fsS "$BASE_URL/api/regions" \
   | python3 -c 'import sys,json; print(next(r["id"] for r in json.load(sys.stdin) if r["name"]=="B区-吊装半径"))')
 curl -fsS -X DELETE "$BASE_URL/api/regions/$B_ID"; echo
 
+echo "== 13. 批量原子变更：一次提交 登记+修订+删除，并对变更后集合核验轨迹 =="
+# 先读取当前全局 revision（乐观并发控制：提交时必须仍为该值）
+REV=$(curl -fsS "$BASE_URL/api/revision" | python3 -c 'import sys,json; print(json.load(sys.stdin)["revision"])')
+# 再造一个本批要删除的区域
+D_ID=$(curl -fsS -X POST "$BASE_URL/api/regions" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "name": "D区-本批删除",
+        "polygon": [[400,0],[500,0],[500,100],[400,100]],
+        "valid_from": "2026-09-01T00:00:00Z",
+        "valid_to":   "2026-10-01T00:00:00Z"
+      }' | python3 -c 'import sys,json; print(json.load(sys.stdin)["region"]["id"])')
+# 注意：登记 D 区后 revision 已 +1，重新读取
+REV=$(curl -fsS "$BASE_URL/api/revision" | python3 -c 'import sys,json; print(json.load(sys.stdin)["revision"])')
+# 整批：修订 A、删除 D、新建 E；附带一条远离所有区域的安全轨迹（带时区绝对时刻）。
+# 任一引用区域不存在、revision 过期、数据非法或轨迹在「变更后」集合上不安全，
+# 都会整批拒绝且不落库；成功时全局 revision 只 +1。
+curl -fsS -X POST "$BASE_URL/api/changes" \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"expected_revision\": $REV,
+        \"operations\": [
+          {\"op\": \"update\", \"region_id\": $A_ID,
+           \"region\": {\"name\": \"A区-批量修订\"}},
+          {\"op\": \"delete\", \"region_id\": $D_ID},
+          {\"op\": \"create\", \"region\": {
+              \"name\": \"E区-批量登记\",
+              \"polygon\": [[600,0],[700,0],[700,100],[600,100]],
+              \"valid_from\": \"2026-09-01T00:00:00Z\",
+              \"valid_to\":   \"2026-10-01T00:00:00Z\"}}
+        ],
+        \"trajectories\": [
+          {\"name\": \"远场安全往返\", \"points\": [
+            {\"x\": 5000, \"y\": 5000, \"t\": \"2026-09-30T00:00:00Z\"},
+            {\"x\": 5100, \"y\": 5100, \"t\": \"2026-09-30T00:01:00Z\"}
+          ]}
+        ]
+      }"; echo
+
 echo "完成。"

@@ -90,6 +90,71 @@ def main() -> None:
                     f"{'（单点接触）' if c['point_contact'] else ''}"
                 )
 
+    # ---- 批量原子变更：登记/修订/删除一次提交 + 变更后轨迹核验 ----
+    rev = call("GET", "/api/revision")["revision"]
+    # 先登记一个本批要删除的区域
+    victim = call("POST", "/api/regions", {
+        "name": "E区-待删除",
+        "polygon": [[200, 0], [300, 0], [300, 100], [200, 100]],
+        "valid_from": "2026-09-01T00:00:00Z",
+        "valid_to": "2026-10-01T00:00:00Z",
+    })
+    victim_id = victim["region"]["id"]
+    rev = call("GET", "/api/revision")["revision"]  # 登记后 revision 已 +1
+
+    batch = {
+        "expected_revision": rev,
+        "operations": [
+            {"op": "update", "region_id": region["region"]["id"],
+             "region": {"name": "A区-批量修订"}},
+            {"op": "delete", "region_id": victim_id},
+            {"op": "create", "region": {
+                "name": "F区-批量登记",
+                "polygon": [[400, 0], [500, 0], [500, 100], [400, 100]],
+                "valid_from": "2026-09-01T00:00:00Z",
+                "valid_to": "2026-10-01T00:00:00Z",
+            }},
+        ],
+        # 至少一条带时区的绝对时刻轨迹；这里是远场安全轨迹
+        "trajectories": [{
+            "name": "远场安全往返",
+            "points": [
+                {"x": 5000, "y": 5000, "t": "2026-09-30T00:00:00Z"},
+                {"x": 5100, "y": 5100, "t": "2026-09-30T00:01:00Z"},
+            ],
+        }],
+    }
+    show("批量原子变更（全部安全 → 提交，revision 只 +1）",
+         call("POST", "/api/changes", batch))
+
+    # 不安全演示：expected_revision 用最新值，但轨迹穿过现存 A 区 → 整批拒绝
+    rev = call("GET", "/api/revision")["revision"]
+    unsafe_batch = {
+        "expected_revision": rev,
+        "operations": [{
+            "op": "create",
+            "region": {
+                "name": "G区-不会建成",
+                "polygon": [[0, 0], [100, 0], [100, 100], [0, 100]],
+                "valid_from": "2026-09-01T00:00:00Z",
+                "valid_to": "2026-10-01T00:00:00Z",
+            },
+        }],
+        "trajectories": [{
+            "name": "穿越A区",
+            "points": [
+                {"x": -50, "y": 50, "t": "2026-09-30T00:00:00Z"},
+                {"x": 150, "y": 50, "t": "2026-09-30T00:01:00Z"},
+            ],
+        }],
+    }
+    try:
+        call("POST", "/api/changes", unsafe_batch)
+    except urllib.error.HTTPError as exc:
+        err = json.loads(exc.read().decode())
+        show(f"不安全轨迹被整批拒绝（HTTP {exc.code}，code="
+             f"{err['error']['code']}）", err)
+
     show("删除示例区域", call("DELETE", f"/api/regions/{region['region']['id']}"))
 
 
