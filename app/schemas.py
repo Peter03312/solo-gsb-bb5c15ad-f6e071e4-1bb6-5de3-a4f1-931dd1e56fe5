@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
+from typing import Annotated, Literal
 
 from pydantic import (
     BaseModel,
@@ -108,6 +109,110 @@ class RegionUpdate(BaseModel):
         return geometry.validate_polygon(v)
 
 
+class RegionCreateInBatch(BaseModel):
+    """批量变更中的登记操作（action 固定为 create）。"""
+
+    action: Literal["create"] = "create"
+    name: str = Field(min_length=1, max_length=200)
+    polygon: list[list[float]] = Field(description="简单多边形顶点 [[x,y], ...]，可闭合可不闭合")
+    valid_from: datetime
+    valid_to: datetime
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("valid_from", "valid_to")
+    @classmethod
+    def _check_time(cls, v: datetime, info):
+        return _require_utc(v, info.field_name)
+
+    @field_validator("polygon")
+    @classmethod
+    def _check_polygon(cls, v):
+        if not isinstance(v, list):
+            raise ValueError("polygon 必须是顶点数组")
+        for i, point in enumerate(v):
+            if not isinstance(point, list) or len(point) != 2:
+                raise ValueError(f"第 {i} 个顶点必须是 [x, y] 形式")
+            _finite(point[0], f"第 {i} 个顶点 x")
+            _finite(point[1], f"第 {i} 个顶点 y")
+        return geometry.validate_polygon(v)
+
+    def validate_time_order(self) -> None:
+        if self.valid_from >= self.valid_to:
+            raise ValueError(
+                "生效时段必须满足 valid_from < valid_to（左闭右开，起早于止）"
+            )
+
+
+class RegionUpdateInBatch(BaseModel):
+    """批量变更中的修订操作（action 固定为 update，字段任意组合的部分更新）。"""
+
+    action: Literal["update"] = "update"
+    region_id: int = Field(ge=1, alias="id")
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    polygon: list[list[float]] | None = None
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    @field_validator("valid_from", "valid_to")
+    @classmethod
+    def _check_time(cls, v, info):
+        return None if v is None else _require_utc(v, info.field_name)
+
+    @field_validator("polygon")
+    @classmethod
+    def _check_polygon(cls, v):
+        if v is None:
+            return None
+        if not isinstance(v, list):
+            raise ValueError("polygon 必须是顶点数组")
+        for i, point in enumerate(v):
+            if not isinstance(point, list) or len(point) != 2:
+                raise ValueError(f"第 {i} 个顶点必须是 [x, y] 形式")
+            _finite(point[0], f"第 {i} 个顶点 x")
+            _finite(point[1], f"第 {i} 个顶点 y")
+        return geometry.validate_polygon(v)
+
+
+class RegionDeleteInBatch(BaseModel):
+    """批量变更中的删除操作（action 固定为 delete）。"""
+
+    action: Literal["delete"] = "delete"
+    region_id: int = Field(ge=1, alias="id")
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+BatchOperation = Annotated[
+    RegionCreateInBatch | RegionUpdateInBatch | RegionDeleteInBatch,
+    Field(discriminator="action"),
+]
+
+
+class RegionBatchRequest(BaseModel):
+    """区域集合的一次性原子变更：登记/修订/删除 + 指定轨迹安全核验。"""
+
+    expected_revision: int = Field(ge=0, description="客户端预期的全局 revision")
+    operations: list[BatchOperation] = Field(
+        min_length=1, description="区域操作列表，元素为 create/update/delete 之一"
+    )
+    trajectories: list[list[PointIn]] = Field(
+        min_length=1, description="至少一条带时区绝对时刻轨迹；每条至少 2 个点"
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("trajectories")
+    @classmethod
+    def _check_trajectories(cls, v):
+        for i, pts in enumerate(v):
+            if not isinstance(pts, list) or len(pts) < 2:
+                raise ValueError(f"第 {i} 条轨迹至少需要 2 个坐标点")
+        return v
+
+
 class VerifyRequest(BaseModel):
     points: list[PointIn] = Field(min_length=2)
 
@@ -211,6 +316,34 @@ class ScheduleResponse(_UTCDatetimeModel):
 class RegionCreatedResponse(_UTCDatetimeModel):
     region: RegionOut
     revision: int
+
+
+class BatchOperationResultOut(BaseModel):
+    """单个操作的结果。
+
+    create：带新分配的 region_id 与 version=1；
+    update：带修订后的 version（原 version +1）；
+    delete：只回显被删除的 region_id 与删除前 version。
+    """
+
+    index: int
+    action: str
+    region_id: int
+    version: int | None = None
+
+
+class TrajectoryCheckOut(_UTCDatetimeModel):
+    """批量变更中单条轨迹对变更后集合的核验结果。"""
+
+    index: int
+    safe: bool
+    results: list[RegionResultOut]
+
+
+class RegionBatchResponse(_UTCDatetimeModel):
+    revision: int
+    operations: list[BatchOperationResultOut]
+    trajectories: list[TrajectoryCheckOut]
 
 
 class RevisionOut(BaseModel):

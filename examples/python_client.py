@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
 import urllib.request
 
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000")
@@ -91,6 +92,48 @@ def main() -> None:
                 )
 
     show("删除示例区域", call("DELETE", f"/api/regions/{region['region']['id']}"))
+
+    # ---- 批量原子变更：多个登记/修订/删除一次提交 + 轨迹安全核验 ----
+    revision = call("GET", "/api/revision")["revision"]
+    batch_payload = {
+        "expected_revision": revision,
+        "operations": [
+            {"action": "create", "name": "批量-A区",
+             "polygon": [[0, 0], [100, 0], [100, 100], [0, 100]],
+             "valid_from": "2026-09-01T00:00:00Z",
+             "valid_to": "2026-10-01T00:00:00Z"},
+            {"action": "create", "name": "批量-B区",
+             "polygon": [[200, 0], [300, 0], [300, 100], [200, 100]],
+             "valid_from": "2026-09-01T00:00:00Z",
+             "valid_to": "2026-10-01T00:00:00Z"},
+        ],
+        # 从区域上方安全经过：整批才会提交；改成 y=50 直穿则会收到
+        # 422 unsafe_trajectory，且整批不落库（revision 不推进）
+        "trajectories": [
+            [{"x": -50, "y": 200, "t": "2026-09-30T00:00:00Z"},
+             {"x": 350, "y": 200, "t": "2026-09-30T00:02:00Z"}],
+        ],
+    }
+    try:
+        batch_result = call("POST", "/api/regions/batch", batch_payload)
+    except urllib.error.HTTPError as exc:
+        err = json.loads(exc.read().decode())
+        if err["error"]["code"] == "revision_conflict":
+            # 并发变更导致过期：用服务端给出的当前 revision 重放一次
+            current = err["error"]["details"][0]["current_revision"]
+            print(f"revision 过期，改用 {current} 重放")
+            batch_payload["expected_revision"] = current
+            batch_result = call("POST", "/api/regions/batch", batch_payload)
+        else:
+            raise
+    show("批量原子变更（整批 revision 只 +1）", batch_result)
+    for op in batch_result["operations"]:
+        print(f"  · {op['action']} -> region_id={op['region_id']} "
+              f"version={op['version']}")
+    for created in batch_result["operations"]:
+        if created["action"] == "create":
+            call("DELETE", f"/api/regions/{created['region_id']}")
+    show("批量示例区域已清理", {"revision": call("GET", "/api/revision")["revision"]})
 
 
 if __name__ == "__main__":

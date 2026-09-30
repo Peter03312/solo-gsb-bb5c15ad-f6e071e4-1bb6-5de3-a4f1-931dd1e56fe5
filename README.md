@@ -27,6 +27,39 @@
   即使核验期间有区域被并发登记/修订/删除，本次核验仍使用同一已提交版本；
   响应中的 `revision` 标明所用集合版本。
 
+## 批量原子变更规则（`POST /api/regions/batch`）
+
+安全员可以把**多处**限行区域的登记/修订/删除放在**一次变更**里提交，并要求
+一条或多条指定通行轨迹在变更后的完整区域集合下仍然安全：
+
+* **请求**：`expected_revision`（预期全局 revision）、`operations`（非空，
+  元素为 `create` / `update` / `delete`，按数组顺序执行）、`trajectories`
+  （至少 1 条带时区绝对时刻轨迹，结构与 `/api/verify` 相同；每条 ≥2 点、
+  时刻严格递增）。
+* **同一现有区域在一批中只能出现一次**：对同一 `id` 两次 update、
+  update 与 delete 混用等都返回 422 `duplicate_region`（create 不占现有 id，
+  可任意多个）。
+* **对变更后完整集合核验**：未被本批涉及的区域原样保留，删除的区域不参与，
+  新建/修订后的区域以新形态参与；沿用直线匀速、**边界接触即穿越**、
+  生效时段 **左闭右开** 的既有规则。所有轨迹必须全部安全。
+* **原子提交**：仅当 revision 匹配、全部操作合法且全部轨迹安全时才落库；
+  已有区域修订沿用 `version = version + 1`，**整批全局 revision 只递增一次**。
+* **并发互斥**：批量接口与单个登记/修订/删除共用同一把全局元数据行锁，
+  写事务在此串行化；基于过期 revision 的并发提交无法绕过校验，直接返回 409。
+* **成功响应**：新 `revision`、逐操作结果（create 带**新区域 ID** 与
+  `version=1`，update 带修订后 `version`，delete 回显被删 id 与删除前
+  version），以及逐轨迹核验结果（含每条轨迹对每个区域的穿越明细）。
+* **失败不落库，原因可区分**：
+
+| 状态码 | error.code | 触发条件 |
+| --- | --- | --- |
+| 409 | `revision_conflict` | `expected_revision` 与当前 revision 不符（details 带当前值） |
+| 404 | `region_not_found` | update/delete 引用了不存在的区域（带操作下标与 id） |
+| 422 | `duplicate_region` | 同一现有区域在一批中出现多次 |
+| 422 | `invalid_operation` | 单条操作语义非法（如修订后 `valid_from >= valid_to`），带操作下标 |
+| 422 | `unsafe_trajectory` | 存在轨迹在变更后集合下穿越；details 列出轨迹下标与穿越起止明细 |
+| 422 | `validation_error` / `invalid_polygon` / `invalid_trajectory` | 结构/多边形/轨迹非法（同既有接口） |
+
 ## 出发时刻调度规则（`POST /api/schedule`）
 
 * **输入**：固定行程用**相对秒数**给出 `{"x","y","t"}`，首点相对秒数必须为 `0`，
@@ -116,6 +149,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/regions/{id}` | 查询单个区域 |
 | PATCH | `/api/regions/{id}` | 修订区域（字段任意组合，部分更新）；`version` +1 |
 | DELETE | `/api/regions/{id}` | 删除区域 |
+| POST | `/api/regions/batch` | 多处区域登记/修订/删除一次原子提交，并核验指定轨迹全部安全 |
 | GET | `/api/revision` | 当前区域集合全局版本号（任意写操作后单调 +1） |
 | POST | `/api/verify` | 对一条绝对时刻轨迹做整段穿越核验 |
 | POST | `/api/schedule` | 对一条相对秒数固定行程，求候选时段内全部安全出发区间 |
@@ -176,6 +210,113 @@ curl -X POST http://localhost:8000/api/regions \
   `exit_inclusive=false`。
 * 无穿越的区域也会出现在 `results` 中（`crossings: []`），保证逐区域可核对。
 
+### 批量原子变更 `POST /api/regions/batch`
+
+把多处区域变更与"这些变更后轨迹必须安全"的前置条件合并为一次原子提交。
+操作按数组顺序在内存中构造**变更后完整区域集合**，再对每条轨迹核验；
+全部通过后才一次性写入，全局 revision 只推进一次。
+
+请求（`update`/`delete` 用 `id` 引用现有区域；`update` 字段任意组合的部分更新）：
+
+```json
+{
+  "expected_revision": 2,
+  "operations": [
+    {
+      "action": "update",
+      "id": 1,
+      "name": "A区-缩小",
+      "polygon": [[0, 0], [50, 0], [50, 50], [0, 50]]
+    },
+    {
+      "action": "delete",
+      "id": 2
+    },
+    {
+      "action": "create",
+      "name": "C区-新作业面",
+      "polygon": [[400, 0], [500, 0], [500, 100], [400, 100]],
+      "valid_from": "2026-10-01T00:00:00Z",
+      "valid_to":   "2026-11-01T00:00:00Z"
+    }
+  ],
+  "trajectories": [
+    [
+      {"x": -50, "y": 200, "t": "2026-10-02T00:00:00Z"},
+      {"x": 900, "y": 200, "t": "2026-10-02T00:02:00Z"}
+    ]
+  ]
+}
+```
+
+成功响应（HTTP 200）：
+
+```json
+{
+  "revision": 3,
+  "operations": [
+    {"index": 0, "action": "update", "region_id": 1, "version": 3},
+    {"index": 1, "action": "delete", "region_id": 2, "version": 4},
+    {"index": 2, "action": "create", "region_id": 5, "version": 1}
+  ],
+  "trajectories": [
+    {
+      "index": 0,
+      "safe": true,
+      "results": [
+        {"region_id": 1, "region_name": "A区-缩小", "crossings": []},
+        {"region_id": 5, "region_name": "C区-新作业面", "crossings": []}
+      ]
+    }
+  ]
+}
+```
+
+* `operations[].index` 回显操作在请求数组中的下标；create 返回新分配的
+  `region_id`；update 的 `version` 是修订后的新版本（原版本 +1）；
+  delete 回显删除前 version。
+* `trajectories[].results` 与 `/api/verify` 的逐区域结构一致（包含边界
+  点接触、被 `valid_to` 截断等开闭标记），但区域集合是**变更后**的集合。
+
+不安全时（HTTP 422，整批取消、不留任何痕迹）只列出发生穿越的轨迹与区域：
+
+```json
+{
+  "error": {
+    "code": "unsafe_trajectory",
+    "message": "存在轨迹在变更后区域集合下发生穿越，整批变更已取消且不落库",
+    "details": [
+      {
+        "trajectory_index": 0,
+        "results": [
+          {
+            "region_id": 5,
+            "region_name": "C区-新作业面",
+            "crossings": [
+              {
+                "entry_time": "2026-10-02T00:01:10Z",
+                "exit_time": "2026-10-02T00:01:30Z",
+                "entry_inclusive": true,
+                "exit_inclusive": true,
+                "point_contact": false
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+* revision 过期（期间有其他登记/修订/删除已提交）返回 **409**
+  `revision_conflict`，`details[0].current_revision` 给出当前值；
+  客户端用新 revision 重新提交即可（乐观并发）。
+* 引用不存在区域返回 **404** `region_not_found`；同一区域在一批中出现
+  多次返回 **422** `duplicate_region`；修订后时段非法等返回 **422**
+  `invalid_operation`（均带操作下标）。上述任一失败整批不落库、
+  revision 不变。
+
 ### 出发时刻调度 `POST /api/schedule`
 
 请求：固定行程用相对首点的秒数（首点 `t=0`、严格递增），候选时段带时区：
@@ -227,10 +368,12 @@ curl -X POST http://localhost:8000/api/regions \
 
 ### 错误响应
 
-统一为 `422`（语义错误）或 `404`（区域不存在）。除通用的
-`validation_error` 外，轨迹类错误使用专用错误码：`/api/verify` 为
-`invalid_trajectory`，`/api/schedule` 的相对轨迹问题同样返回
-`invalid_trajectory`，候选时段不递增返回 `invalid_input`：
+统一使用 `422`（语义错误）、`404`（区域不存在）或 `409`（批量提交的
+revision 冲突）。除通用的 `validation_error` 外，轨迹类错误使用专用错误码：
+`/api/verify` 为 `invalid_trajectory`，`/api/schedule` 的相对轨迹问题同样返回
+`invalid_trajectory`，候选时段不递增返回 `invalid_input`；
+`/api/regions/batch` 另用 `revision_conflict`（409）、`region_not_found`（404）、
+`duplicate_region`、`invalid_operation`、`unsafe_trajectory`（均 422）：
 
 ```json
 {
@@ -249,6 +392,9 @@ curl -X POST http://localhost:8000/api/regions \
 # 核验穿越、修订与删除
 bash examples/curl_examples.sh
 
+# 批量原子变更（登记/修订/删除 + 轨迹核验；含不安全拒绝、revision 冲突重放）
+bash examples/curl_batch.sh
+
 # 仅用 Python 标准库的调用示例（含调度两段安全区间演示）
 python3 examples/python_client.py
 ```
@@ -265,18 +411,22 @@ python3 tests/test_schedule_geometry.py
 
 # HTTP + PostgreSQL 集成测试（需要可连接的数据库，会清空 regions 表）
 DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_api.py
+
+# 批量原子变更 API 集成测试（成功/各种拒绝原因/左闭右开端点/并发竞争，
+# 同样会清空 regions 表）
+DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_batch_api.py
 ```
 
 ## 项目结构
 
 ```
 app/
-  main.py        # FastAPI 路由、事务边界、错误处理（verify 与 schedule）
-  schemas.py     # Pydantic 请求/响应模型与输入校验
+  main.py        # FastAPI 路由、事务边界、错误处理（verify、schedule、batch）
+  schemas.py     # Pydantic 请求/响应模型与输入校验（含批量操作判别联合）
   geometry.py    # 穿越核验与安全出发区间引擎（插值、裁剪、合并、区间差）
-  repository.py  # 区域 CRUD 与一致性快照读取
+  repository.py  # 区域 CRUD、一致性快照读取、批量原子变更事务
   db.py          # psycopg3 连接池、建表初始化、启动重试
-examples/        # curl 与 Python 调用示例（含调度）
-tests/           # 几何离线测试与 API 集成测试
+examples/        # curl 与 Python 调用示例（含批量原子变更）
+tests/           # 几何离线测试与 API/批量变更集成测试
 Dockerfile, docker-compose.yml
 ```
